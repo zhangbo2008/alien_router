@@ -1,6 +1,9 @@
 // Package alien is a lightweight http router from outer space.
 package alien
 
+
+
+//整体思路还是很清晰,只是一个简单的树的结构,只在node修改时候加入读写锁而已.就这么一点并发代码.
 import (
 	"errors"
 	"net/http"
@@ -20,13 +23,18 @@ var (
 type nodeType int
 
 const (
-	nodeRoot nodeType = iota
+	nodeRoot nodeType = iota          //只是设置一些flag做区分. 这里面当成枚举类来使用.很方便做flag效果.
 	nodeParam
 	nodeNormal
 	nodeCatchAll
 	nodeEnd
 )
 
+
+
+
+// node是一个树, 一个节点里面有一堆node,然后每一个node里面还有一堆node也就是他的children
+//跟家谱一样.
 type node struct {
 	key      rune
 	typ      nodeType
@@ -35,6 +43,11 @@ type node struct {
 	children []*node
 }
 
+
+
+
+//节点的分支创建.
+//这个函数是新建一个node放入node的childeren里面.
 func (n *node) branch(key rune, val *route, typ ...nodeType) *node {
 	child := &node{
 		key:   key,
@@ -47,6 +60,10 @@ func (n *node) branch(key rune, val *route, typ ...nodeType) *node {
 	return child
 }
 
+
+
+
+// 返回第一个key为key的儿子.
 func (n *node) findChild(key rune) *node {
 	for _, v := range n.children {
 		if v.key == key {
@@ -56,12 +73,20 @@ func (n *node) findChild(key rune) *node {
 	return nil
 }
 
+
+
+
 func (n *node) insert(pattern string, val *route) error {
-	n.mu.Lock()
+	n.mu.Lock()  //读写锁,保证并发.
 	defer n.mu.Unlock()
+
+	//必须根节点才能调这个insert函数.
 	if n.typ != nodeRoot {
 		return errors.New("inserting on a non root node")
 	}
+
+
+	//level表示当前的node节点
 	var level *node
 	var child *node
 
@@ -69,26 +94,38 @@ func (n *node) insert(pattern string, val *route) error {
 		return errors.New("empty pattern is not supported")
 	}
 
+
+	//下面对pattern进行遍历,也就是字符串遍历.
 	for k, ch := range pattern {
 		if k == 0 {
 			if ch != '/' {
 				return errors.New("path must start with slash ")
 			}
-			level = n
+			level = n  //level从根节点开始赋值.
 		}
 
-		child = level.findChild(ch)
+		child = level.findChild(ch)  //找到匹配的node
 		switch level.typ {
-		case nodeParam:
-			if k < len(pattern) && ch != '/' {
+		case nodeParam:   //这个switch用于跳过参数节点.因为参数节点不是一个需要进入的node
+			if k < len(pattern) && ch != '/' {// 如果k复合要求并且 ch不是标识符就继续解析下面的,跳过这个参数节点.
 				continue
 			}
 		}
+
+
+
+
+
 		if child != nil {
-			level = child
+			level = child       //进入下一层.
 			continue
 		}
+
+
 		switch ch {
+		// 支持两种开头一个是: 一个是*
+
+		//根据3中类型进行 节点的分支创建.
 		case ':':
 			level = level.branch(ch, nil, nodeParam)
 		case '*':
@@ -96,30 +133,45 @@ func (n *node) insert(pattern string, val *route) error {
 		default:
 			level = level.branch(ch, nil, nodeNormal)
 		}
+
+
+
 	}
 	level.branch(eof, val, nodeEnd)
 	return nil
 }
 
+
+
+
 func (n *node) find(path string) (*route, error) {
-	n.mu.RLock()
+	n.mu.RLock() //保证并发修改节点不会报错.
 	defer n.mu.RUnlock()
+
+	//还是只让跟节点 才能调用这个函数.
 	if n.typ != nodeRoot {
 		return nil, errors.New("non node search")
 	}
 	var level *node
 	var isParam bool
+
+
 	for k, ch := range path {
 		if k == 0 {
 			level = n
 		}
 		c := level.findChild(ch)
+
+		//还是是参数节点就跳过.
 		if isParam {
 			if k < len(path) && ch != '/' {
 				continue
 			}
 			isParam = false
 		}
+
+
+		// 如果找到了匹配的节点,就进入这个节点,进行下一层搜索.
 		param := level.findChild(':')
 		if param != nil {
 			level = param
@@ -137,6 +189,9 @@ func (n *node) find(path string) (*route, error) {
 		}
 		return nil, errRouteNotFound
 	}
+
+
+	//下面是如果是普通节点就返回,如果还没找到就需要报错了.
 	if level != nil {
 		end := level.findChild(eof)
 		if end != nil {
@@ -149,8 +204,20 @@ func (n *node) find(path string) (*route, error) {
 			}
 		}
 	}
+
+
+
 	return nil, errRouteNotFound
 }
+
+
+
+
+
+
+//下面route就是再封装node了.
+//加入ServeHTTP 函数调用.
+
 
 type route struct {
 	path       string
@@ -252,15 +319,15 @@ func GetParams(r *http.Request) Params {
 	return nil
 }
 
-type router struct {
+type router struct {        //内部时一堆node,每一个node代表一个操作.
 	get, post, patch, put, head     *node
 	connect, options, trace, delete *node
 }
 
 func (r *router) addRoute(method, path string, h func(http.ResponseWriter, *http.Request), wares ...func(http.Handler) http.Handler) error {
-	newRoute := &route{path: path, handler: h}
+	newRoute := &route{path: path, handler: h}    //构造函数并且返回地址.
 	if len(wares) > 0 {
-		newRoute.middleware = append(newRoute.middleware, wares...)
+		newRoute.middleware = append(newRoute.middleware, wares...)// 中间处理函数放进去
 	}
 	switch method {
 	case "GET":
@@ -354,6 +421,8 @@ func (r *router) find(method, path string) (*route, error) {
 	return nil, errRouteNotFound
 }
 
+
+//Mux 对象是一个多路由匹配规则.
 // Mux is a http multiplexer that allows matching of http requests to the
 // registered http handlers.
 //
@@ -382,8 +451,51 @@ type Mux struct {
 	prefix     string
 	middleware []func(http.Handler) http.Handler
 	notFound   http.Handler
-	*router
+	*router         //Mux 里面有匿名结构体,router所以他继承了路由.可以调用路由的属性和方法.
 }
+
+
+
+
+
+
+
+// 这个是开始函数.
+
+
+/*
+
+
+
+
+整个代码结构这样.
+
+
+首先我们最后用的是Mux对象.也就是New函数的return
+
+Mux对象继承router
+
+
+
+router结构体定义为一堆属性.get, del,post
+这些属性的值都是node.
+
+
+所以本质是node
+
+
+
+
+*/
+
+
+
+
+
+
+
+
+
 
 // New returns a new *Mux instance with default handler for mismatched routes.
 func New() *Mux {
@@ -391,9 +503,27 @@ func New() *Mux {
 	m.router = &router{}
 	m.notFound = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, errRouteNotFound.Error(), http.StatusNotFound)
+
+
+		//http.Error 里面写上错误的信息和code码即可.  w是返回对象.
 	})
 	return m
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // AddRoute registers h with pattern and method. If there is a path prefix
 // created via the Group method) it will be set.
@@ -401,8 +531,17 @@ func (m *Mux) AddRoute(method, pattern string, h func(http.ResponseWriter, *http
 	if m.prefix != "" {
 		pattern = path.Join(m.prefix, pattern)
 	}
-	return m.addRoute(method, pattern, h, m.middleware...)
+	return m.addRoute(method, pattern, h, m.middleware...)//???m 是什么哪有addRoute
 }
+
+
+
+
+
+
+
+
+
 
 // Get registers h with pattern and method GET.
 func (m *Mux) Get(pattern string, h func(http.ResponseWriter, *http.Request)) error {
